@@ -17,22 +17,9 @@
  */
 package org.apache.cassandra.db.compaction;
 
-import java.io.File;
-import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.util.*;
-import java.util.concurrent.*;
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
-import javax.management.openmbean.OpenDataException;
-import javax.management.openmbean.TabularData;
-
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.*;
 import com.google.common.util.concurrent.*;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.cache.AutoSavingCache;
 import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
 import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
@@ -59,6 +46,18 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.*;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.concurrent.Refs;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
+import javax.management.openmbean.OpenDataException;
+import javax.management.openmbean.TabularData;
+import java.io.File;
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.util.*;
+import java.util.concurrent.*;
 
 import static java.util.Collections.singleton;
 
@@ -1032,7 +1031,7 @@ public class CompactionManager implements CompactionManagerMBean
      * but without writing the merge result
      */
     @SuppressWarnings("resource")
-    private void doValidationCompaction(ColumnFamilyStore cfs, Validator validator) throws IOException
+    private void doValidationCompaction(final ColumnFamilyStore cfs, Validator validator) throws IOException
     {
         // this isn't meant to be race-proof, because it's not -- it won't cause bugs for a CFS to be dropped
         // mid-validation, or to attempt to validate a droped CFS.  this is just a best effort to avoid useless work,
@@ -1066,7 +1065,17 @@ public class CompactionManager implements CompactionManagerMBean
             else
             {
                 // flush first so everyone is validating data that is as similar as possible
-                StorageService.instance.forceKeyspaceFlush(cfs.keyspace.getName(), cfs.name);
+                try {
+                    mayWaitForCompaction(cfs, new Callable<Object>() {
+                        @Override
+                        public Object call() throws IOException {
+                            StorageService.instance.forceKeyspaceFlush(cfs.keyspace.getName(), cfs.name);
+                            return this;
+                        }
+                    });
+                } catch (Exception e) {
+                    throw (IOException)e;
+                }
                 ActiveRepairService.ParentRepairSession prs = ActiveRepairService.instance.getParentRepairSession(validator.desc.parentSessionId);
                 ColumnFamilyStore.RefViewFragment sstableCandidates = cfs.selectAndReference(prs.isIncremental ? ColumnFamilyStore.UNREPAIRED_SSTABLES : ColumnFamilyStore.CANONICAL_SSTABLES);
                 Set<SSTableReader> sstablesToValidate = new HashSet<>();
@@ -1688,5 +1697,39 @@ public class CompactionManager implements CompactionManagerMBean
             else
                 break;
         }
+    }
+
+    public void mayWaitForCompaction(ColumnFamilyStore cfs, Callable<?> callable) throws Exception {
+        int compactionMaxL0SStableNumber = DatabaseDescriptor.getCompactionMaxL0SStableCount();
+        if (compactionMaxL0SStableNumber == 0)
+        {
+            callable.call();
+            return;
+        }
+
+        while (true) {
+            if (getL0SStableCount(cfs) <= compactionMaxL0SStableNumber) {
+                synchronized (cfs) {
+                    if (getL0SStableCount(cfs) <= compactionMaxL0SStableNumber) {
+                        callable.call();
+                        return;
+                    }
+                }
+            }
+
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                logger.warn("Interrupted while waiting for compaction.");
+            }
+        }
+    }
+
+    private int getL0SStableCount(ColumnFamilyStore cfs) {
+        int[] leveledSStables = cfs.getSSTableCountPerLevel();
+        if (leveledSStables != null && leveledSStables.length > 0) {
+            return leveledSStables[0];
+        }
+        return 0;
     }
 }

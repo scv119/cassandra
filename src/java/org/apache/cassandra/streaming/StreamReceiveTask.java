@@ -25,9 +25,11 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import org.apache.cassandra.db.compaction.CompactionManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -125,54 +127,60 @@ public class StreamReceiveTask extends StreamTask
                     task.session.taskCompleted(task);
                     return;
                 }
-                ColumnFamilyStore cfs = Keyspace.open(kscf.left).getColumnFamilyStore(kscf.right);
+                final ColumnFamilyStore cfs = Keyspace.open(kscf.left).getColumnFamilyStore(kscf.right);
 
-                File lockfiledir = cfs.directories.getWriteableLocationAsFile(task.sstables.size() * 256L);
-                if (lockfiledir == null)
-                    throw new IOError(new IOException("All disks full"));
-                StreamLockfile lockfile = new StreamLockfile(lockfiledir, UUID.randomUUID());
-                lockfile.create(task.sstables);
-                List<SSTableReader> readers = new ArrayList<>();
-                for (SSTableWriter writer : task.sstables)
-                    readers.add(writer.finish(true));
-                lockfile.delete();
-                task.sstables.clear();
+                CompactionManager.instance.mayWaitForCompaction(cfs, new Callable<Object>() {
+                    @Override
+                    public Object call() throws Exception {
+                        File lockfiledir = cfs.directories.getWriteableLocationAsFile(task.sstables.size() * 256L);
+                        if (lockfiledir == null)
+                            throw new IOError(new IOException("All disks full"));
+                        StreamLockfile lockfile = new StreamLockfile(lockfiledir, UUID.randomUUID());
+                        lockfile.create(task.sstables);
+                        List<SSTableReader> readers = new ArrayList<>();
+                        for (SSTableWriter writer : task.sstables)
+                            readers.add(writer.finish(true));
+                        lockfile.delete();
+                        task.sstables.clear();
 
-                try (Refs<SSTableReader> refs = Refs.ref(readers))
-                {
-                    // add sstables and build secondary indexes
-                    cfs.addSSTables(readers);
-                    cfs.indexManager.maybeBuildSecondaryIndexes(readers, cfs.indexManager.allIndexesNames());
-
-                    //invalidate row and counter cache
-                    if (cfs.isRowCacheEnabled() || cfs.metadata.isCounter())
-                    {
-                        List<Bounds<Token>> boundsToInvalidate = new ArrayList<>(readers.size());
-                        for (SSTableReader sstable : readers)
-                            boundsToInvalidate.add(new Bounds<Token>(sstable.first.getToken(), sstable.last.getToken()));
-                        Set<Bounds<Token>> nonOverlappingBounds = Bounds.getNonOverlappingBounds(boundsToInvalidate);
-
-                        if (cfs.isRowCacheEnabled())
+                        try (Refs<SSTableReader> refs = Refs.ref(readers))
                         {
-                            int invalidatedKeys = cfs.invalidateRowCache(nonOverlappingBounds);
-                            if (invalidatedKeys > 0)
-                                logger.debug("[Stream #{}] Invalidated {} row cache entries on table {}.{} after stream " +
-                                             "receive task completed.", task.session.planId(), invalidatedKeys,
-                                             cfs.keyspace.getName(), cfs.getColumnFamilyName());
+                            // add sstables and build secondary indexes
+                            cfs.addSSTables(readers);
+                            cfs.indexManager.maybeBuildSecondaryIndexes(readers, cfs.indexManager.allIndexesNames());
+
+                            //invalidate row and counter cache
+                            if (cfs.isRowCacheEnabled() || cfs.metadata.isCounter())
+                            {
+                                List<Bounds<Token>> boundsToInvalidate = new ArrayList<>(readers.size());
+                                for (SSTableReader sstable : readers)
+                                    boundsToInvalidate.add(new Bounds<Token>(sstable.first.getToken(), sstable.last.getToken()));
+                                Set<Bounds<Token>> nonOverlappingBounds = Bounds.getNonOverlappingBounds(boundsToInvalidate);
+
+                                if (cfs.isRowCacheEnabled())
+                                {
+                                    int invalidatedKeys = cfs.invalidateRowCache(nonOverlappingBounds);
+                                    if (invalidatedKeys > 0)
+                                        logger.debug("[Stream #{}] Invalidated {} row cache entries on table {}.{} after stream " +
+                                                        "receive task completed.", task.session.planId(), invalidatedKeys,
+                                                cfs.keyspace.getName(), cfs.getColumnFamilyName());
+                                }
+
+                                if (cfs.metadata.isCounter())
+                                {
+                                    int invalidatedKeys = cfs.invalidateCounterCache(nonOverlappingBounds);
+                                    if (invalidatedKeys > 0)
+                                        logger.debug("[Stream #{}] Invalidated {} counter cache entries on table {}.{} after stream " +
+                                                        "receive task completed.", task.session.planId(), invalidatedKeys,
+                                                cfs.keyspace.getName(), cfs.getColumnFamilyName());
+                                }
+                            }
                         }
 
-                        if (cfs.metadata.isCounter())
-                        {
-                            int invalidatedKeys = cfs.invalidateCounterCache(nonOverlappingBounds);
-                            if (invalidatedKeys > 0)
-                                logger.debug("[Stream #{}] Invalidated {} counter cache entries on table {}.{} after stream " +
-                                             "receive task completed.", task.session.planId(), invalidatedKeys,
-                                             cfs.keyspace.getName(), cfs.getColumnFamilyName());
-                        }
+                        task.session.taskCompleted(task);
+                        return this;
                     }
-                }
-
-                task.session.taskCompleted(task);
+                });
             }
             catch (Throwable t)
             {

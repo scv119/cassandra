@@ -1128,6 +1128,11 @@ public class DatabaseDescriptor
         return Boolean.getBoolean("cassandra.disable_stcs_in_l0");
     }
 
+    public static int getCompactionMaxL0SStableCount()
+    {
+        return conf.compaction_max_l0_sstable_count;
+    }
+
     public static int getStreamThroughputOutboundMegabitsPerSec()
     {
         return conf.stream_throughput_outbound_megabits_per_sec;

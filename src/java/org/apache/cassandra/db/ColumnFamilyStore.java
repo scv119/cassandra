@@ -41,6 +41,7 @@ import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.db.lifecycle.Tracker;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.notifications.INotificationConsumer;
 import org.json.simple.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -1054,6 +1055,10 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
 
         private Flush(boolean truncate)
         {
+            logger.warn("Flush triggered!");
+            for (StackTraceElement element:(new Throwable()).getStackTrace()) {
+                logger.warn(element.toString());
+            }
             // if true, we won't flush, we'll just wait for any outstanding writes, switch the memtable, and discard
             this.truncate = truncate;
 

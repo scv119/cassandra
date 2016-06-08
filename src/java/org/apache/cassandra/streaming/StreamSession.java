@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import com.google.common.base.Function;
 import com.google.common.collect.*;
 
+import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.slf4j.Logger;
@@ -724,12 +725,20 @@ public class StreamSession implements IEndpointStateChangeSubscriber
      * Flushes matching column families from the given keyspace, or all columnFamilies
      * if the cf list is empty.
      */
-    private void flushSSTables(Iterable<ColumnFamilyStore> stores)
-    {
-        List<Future<?>> flushes = new ArrayList<>();
-        for (ColumnFamilyStore cfs : stores)
-            flushes.add(cfs.forceFlush());
-        FBUtilities.waitOnFutures(flushes);
+    private void flushSSTables(Iterable<ColumnFamilyStore> stores) {
+        for (final ColumnFamilyStore cfs : stores) {
+            try {
+                CompactionManager.instance.mayWaitForCompaction(cfs, new Callable<Object>() {
+                    @Override
+                    public Object call() {
+                        FBUtilities.waitOnFuture(cfs.forceFlush());
+                        return this;
+                    }
+                });
+            } catch (Exception e) {
+                logger.error("Shouldn't throw here.", e);
+            }
+        }
     }
 
     private void prepareReceiving(StreamSummary summary)
